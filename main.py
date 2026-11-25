@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
@@ -17,9 +18,10 @@ from modules.drift_detector import compare_baseline, save_baseline
 from modules.header_scanner import scan_headers
 from modules.port_scanner import scan_ports
 from modules.remediator import generate_remediation
+from modules.reporter import export_html, export_markdown
 from modules.ssl_inspector import inspect_ssl
 
-VERSION = "0.4"
+VERSION = "1.0"
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 console = Console()
@@ -126,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="Compare current scan results against a previously saved JSON baseline.",
+    )
+    parser.add_argument(
+        "--output",
+        choices=["md", "html", "both"],
+        default=None,
+        help="Export audit report to reports/ in Markdown, HTML, or both formats.",
     )
     return parser
 
@@ -399,7 +407,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             port_result = scan_ports(hostname)
             display_port_results(port_result)
 
+    remediation_snippet: str | None = None
     if args.remediate:
+        remediation_snippet = generate_remediation(scan_result, args.remediate)
         display_remediation_panel(scan_result, args.remediate)
 
     current_snapshot_input = {
@@ -409,6 +419,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "port_results": port_result or {"open_ports": []},
     }
 
+    drift_result: dict[str, Any] | None = None
     if args.diff:
         drift_result = compare_baseline(current_snapshot_input, args.diff)
         display_drift_report(drift_result)
@@ -421,6 +432,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 style="bold green",
             )
         )
+
+    if args.output:
+        report_payload = {
+            "url": validated_url,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "header_results": scan_result,
+            "ssl_results": ssl_result,
+            "port_results": port_result,
+            "remediation": remediation_snippet,
+            "remediation_stack": args.remediate,
+            "drift_results": drift_result,
+        }
+        if args.output in {"md", "both"}:
+            md_path = export_markdown(report_payload)
+            console.print(Text(f"Markdown report saved: {md_path}", style="bold green"))
+        if args.output in {"html", "both"}:
+            html_path = export_html(report_payload)
+            console.print(Text(f"HTML report saved: {html_path}", style="bold green"))
 
     return 0
 

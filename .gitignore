@@ -51,5 +51,6 @@ env.bak/
 venv.bak/
 
 # PostureGuard generated reports
+reports/*.json
 reports/*.md
 reports/*.html
