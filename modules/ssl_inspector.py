@@ -18,8 +18,10 @@ def _flatten_rdn(rdns: tuple[Any, ...] | None) -> dict[str, str]:
     if not rdns:
         return flattened
     for rdn in rdns:
-        for key, value in rdn:
-            flattened[str(key)] = str(value)
+        for entry in rdn:
+            if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                key, value = entry
+                flattened[str(key)] = str(value)
     return flattened
 
 
@@ -85,7 +87,26 @@ def inspect_ssl(url: str, timeout: int = 5) -> dict[str, Any]:
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     hostname = parsed.hostname
-    port = parsed.port or (443 if scheme == "https" else 80)
+
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        return _ssl_error_result(
+            hostname,
+            443 if scheme == "https" else 80,
+            exc,
+            f"Invalid port in URL '{url}': {exc}",
+        )
+
+    if parsed_port is not None and parsed_port < 1:
+        return _ssl_error_result(
+            hostname,
+            parsed_port,
+            ValueError(f"Port out of valid range: {parsed_port}"),
+            f"Invalid port number {parsed_port} in URL '{url}'.",
+        )
+
+    port = parsed_port if parsed_port is not None else (443 if scheme == "https" else 80)
 
     if scheme == "http":
         return {
@@ -102,6 +123,14 @@ def inspect_ssl(url: str, timeout: int = 5) -> dict[str, Any]:
             "warning": None,
             "error": None,
         }
+
+    if scheme != "https":
+        return _ssl_error_result(
+            hostname,
+            port,
+            ValueError(f"Unsupported scheme: {scheme}"),
+            f"Unsupported URL scheme '{scheme}' for SSL/TLS inspection.",
+        )
 
     if not hostname:
         return {
@@ -150,13 +179,21 @@ def inspect_ssl(url: str, timeout: int = 5) -> dict[str, Any]:
 
     not_before = cert.get("notBefore")
     not_after = cert.get("notAfter")
-    days_remaining = _parse_days_remaining(not_after)
-
     warnings: list[str] = []
-    if days_remaining is not None and days_remaining < CERT_EXPIRY_WARNING_DAYS:
-        warnings.append(
-            f"Certificate expires in {days_remaining} days (< {CERT_EXPIRY_WARNING_DAYS} days)."
-        )
+
+    try:
+        days_remaining = _parse_days_remaining(not_after)
+    except ValueError:
+        days_remaining = None
+        warnings.append("Unable to parse certificate expiration date.")
+
+    if days_remaining is not None:
+        if days_remaining < 0:
+            warnings.append(f"Certificate expired {abs(days_remaining)} days ago.")
+        elif days_remaining < CERT_EXPIRY_WARNING_DAYS:
+            warnings.append(
+                f"Certificate expires in {days_remaining} days (< {CERT_EXPIRY_WARNING_DAYS} days)."
+            )
     if tls_version in LEGACY_TLS_VERSIONS:
         warnings.append(f"Deprecated TLS protocol negotiated: {tls_version}.")
 

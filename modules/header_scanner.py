@@ -7,7 +7,8 @@ from typing import Any
 
 import requests
 
-USER_AGENT = "PostureGuard/0.2"
+USER_AGENT = "PostureGuard/1.0"
+MAX_REDIRECTS = 10
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ def _error_result(url: str, exc: Exception, message: str) -> dict[str, Any]:
     return {
         "url": url,
         "final_url": None,
+        "redirected": False,
         "status_code": None,
         "error": message,
         "error_type": type(exc).__name__,
@@ -133,12 +135,22 @@ def scan_headers(url: str, timeout: int = 10) -> dict[str, Any]:
         Structured dictionary containing findings, score, grade, or error info.
     """
     try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=timeout,
-            allow_redirects=True,
-        )
+        with requests.Session() as session:
+            session.max_redirects = MAX_REDIRECTS
+            with session.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=timeout,
+                allow_redirects=True,
+                stream=True,
+            ) as response:
+                raw_headers = response.headers or {}
+                normalized_headers = {
+                    str(key).lower(): str(value)
+                    for key, value in raw_headers.items()
+                }
+                final_url = getattr(response, "url", url)
+                status_code = getattr(response, "status_code", None)
     except requests.exceptions.Timeout as exc:
         return _error_result(
             url,
@@ -157,11 +169,6 @@ def scan_headers(url: str, timeout: int = 10) -> dict[str, Any]:
             exc,
             f"HTTP request error while scanning {url}: {exc}",
         )
-
-    normalized_headers = {
-        str(key).lower(): str(value)
-        for key, value in response.headers.items()
-    }
 
     security_findings: list[dict[str, Any]] = []
     score = 0
@@ -201,8 +208,9 @@ def scan_headers(url: str, timeout: int = 10) -> dict[str, Any]:
 
     return {
         "url": url,
-        "final_url": getattr(response, "url", url),
-        "status_code": getattr(response, "status_code", None),
+        "final_url": final_url,
+        "redirected": bool(final_url and final_url != url),
+        "status_code": status_code,
         "error": None,
         "security_headers": security_findings,
         "info_disclosure": disclosure_findings,

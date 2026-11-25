@@ -1,6 +1,9 @@
 """Offline unit tests for Auto-Remediation and Security Drift Detection."""
 
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from modules.drift_detector import compare_baseline, save_baseline
 from modules.remediator import generate_remediation
@@ -9,7 +12,7 @@ from modules.remediator import generate_remediation
 def _sample_header_results(
     missing: list[str] | None = None,
     exposed: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     all_headers = [
         "Strict-Transport-Security",
         "Content-Security-Policy",
@@ -129,8 +132,24 @@ def test_save_and_compare_baseline_detects_regression(tmp_path: Path) -> None:
     assert drift["closed_ports"] == []
 
 
-def test_compare_baseline_handles_missing_and_corrupted_files(tmp_path: Path) -> None:
-    """Missing or corrupted baseline files should return ERROR status without crashing."""
+@pytest.mark.parametrize(
+    "bad_json",
+    [
+        "",
+        "{not valid json",
+        "{}",
+        '{"header_results": "not-a-dict"}',
+        '{"security_headers": [123]}',
+        '{"header_score": true, "missing_headers": []}',
+        '{"header_score": 50, "missing_headers": "bad"}',
+        '{"security_headers": [], "open_ports": [{"not_port": 1}]}',
+    ],
+)
+def test_compare_baseline_handles_missing_corrupted_and_invalid_schema(
+    tmp_path: Path,
+    bad_json: str,
+) -> None:
+    """Missing, empty, corrupted, or schema-invalid baseline files should return ERROR status."""
     current = {
         "url": "https://example.com",
         "header_score": 100,
@@ -144,8 +163,26 @@ def test_compare_baseline_handles_missing_and_corrupted_files(tmp_path: Path) ->
     assert missing_drift["status"] == "ERROR"
     assert missing_drift["error"]
 
-    corrupted_file = tmp_path / "corrupted.json"
-    corrupted_file.write_text("{not valid json", encoding="utf-8")
-    corrupted_drift = compare_baseline(current, str(corrupted_file))
-    assert corrupted_drift["status"] == "ERROR"
-    assert corrupted_drift["error"]
+    bad_file = tmp_path / "bad_baseline.json"
+    bad_file.write_text(bad_json, encoding="utf-8")
+    drift = compare_baseline(current, str(bad_file))
+    assert drift["status"] == "ERROR"
+    assert drift["error"]
+
+
+def test_save_baseline_rejects_empty_and_directory_paths(tmp_path: Path) -> None:
+    """save_baseline() should raise ValueError/IsADirectoryError on invalid paths."""
+    current = {
+        "url": "https://example.com",
+        "header_score": 100,
+        "header_grade": "A",
+        "missing_headers": [],
+        "open_ports": [],
+        "ssl_status": "ok",
+    }
+
+    with pytest.raises(ValueError):
+        save_baseline(current, "   ")
+
+    with pytest.raises(IsADirectoryError):
+        save_baseline(current, str(tmp_path))

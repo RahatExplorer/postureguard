@@ -8,44 +8,98 @@ from pathlib import Path
 from typing import Any
 
 
+def _require_int(value: Any, field_name: str) -> int:
+    """Validate that a field is an integer and not a boolean."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"Field '{field_name}' must be an integer.")
+    return value
+
+
 def build_baseline_snapshot(scan_data: dict[str, Any]) -> dict[str, Any]:
-    """Normalize scan output into a compact, serializable baseline snapshot."""
+    """Normalize and validate scan output into a serializable baseline snapshot."""
+    if not isinstance(scan_data, dict):
+        raise ValueError("Scan data must be a JSON object.")
+
     if "header_score" in scan_data and "missing_headers" in scan_data:
+        raw_missing = scan_data["missing_headers"]
+        if not isinstance(raw_missing, list) or not all(
+            isinstance(h, str) for h in raw_missing
+        ):
+            raise ValueError("Field 'missing_headers' must be a list of strings.")
+
+        raw_ports = scan_data.get("open_ports", [])
+        if not isinstance(raw_ports, list):
+            raise ValueError("Field 'open_ports' must be a list.")
+
+        open_ports = sorted(
+            _require_int(p, "open_ports[]") for p in raw_ports
+        )
         return {
-            "timestamp": scan_data.get("timestamp")
-            or datetime.now(timezone.utc).isoformat(),
-            "url": scan_data.get("url", ""),
-            "header_score": int(scan_data.get("header_score", 0)),
+            "timestamp": str(
+                scan_data.get("timestamp")
+                or datetime.now(timezone.utc).isoformat()
+            ),
+            "url": str(scan_data.get("url", "")),
+            "header_score": _require_int(scan_data["header_score"], "header_score"),
             "header_grade": str(scan_data.get("header_grade", "F")),
-            "missing_headers": sorted(str(h) for h in scan_data.get("missing_headers", [])),
-            "open_ports": sorted(int(p) for p in scan_data.get("open_ports", [])),
+            "missing_headers": sorted(raw_missing),
+            "open_ports": open_ports,
             "ssl_status": str(scan_data.get("ssl_status", "unknown")),
         }
 
-    header_results = scan_data.get("header_results", scan_data)
-    ssl_results = scan_data.get("ssl_results") or {}
-    port_results = scan_data.get("port_results") or {}
+    if "header_results" not in scan_data and "security_headers" not in scan_data:
+        raise ValueError(
+            "Invalid baseline JSON structure: missing required scan fields."
+        )
 
-    missing_headers = sorted(
-        str(item["header"])
-        for item in header_results.get("security_headers", [])
-        if item.get("status") == "Missing" and item.get("header")
-    )
+    header_results = scan_data.get("header_results", scan_data)
+    if not isinstance(header_results, dict):
+        raise ValueError("Field 'header_results' must be a JSON object.")
+
+    sec_headers = header_results.get("security_headers")
+    if not isinstance(sec_headers, list):
+        raise ValueError("Field 'security_headers' must be a list.")
+
+    missing_headers_list: list[str] = []
+    for item in sec_headers:
+        if not isinstance(item, dict) or not isinstance(item.get("header"), str):
+            raise ValueError("Each security_headers entry must be an object with 'header'.")
+        if item.get("status") == "Missing":
+            missing_headers_list.append(item["header"])
+
+    ssl_results = scan_data.get("ssl_results")
+    if ssl_results is not None and not isinstance(ssl_results, dict):
+        raise ValueError("Field 'ssl_results' must be a JSON object.")
+    ssl_results = ssl_results or {}
+
+    port_results = scan_data.get("port_results")
+    if port_results is not None and not isinstance(port_results, dict):
+        raise ValueError("Field 'port_results' must be a JSON object.")
+    port_results = port_results or {}
 
     raw_ports = port_results.get("open_ports", scan_data.get("open_ports", []))
-    open_ports = sorted(
-        int(entry["port"] if isinstance(entry, dict) else entry)
-        for entry in raw_ports
-    )
+    if not isinstance(raw_ports, list):
+        raise ValueError("Field 'open_ports' must be a list.")
+
+    parsed_ports: list[int] = []
+    for entry in raw_ports:
+        if isinstance(entry, dict):
+            if "port" not in entry:
+                raise ValueError("Each open_ports entry object must include 'port'.")
+            parsed_ports.append(_require_int(entry["port"], "open_ports[].port"))
+        else:
+            parsed_ports.append(_require_int(entry, "open_ports[]"))
 
     return {
-        "timestamp": scan_data.get("timestamp")
-        or datetime.now(timezone.utc).isoformat(),
-        "url": scan_data.get("url") or header_results.get("url", ""),
-        "header_score": int(header_results.get("score", 0)),
+        "timestamp": str(
+            scan_data.get("timestamp")
+            or datetime.now(timezone.utc).isoformat()
+        ),
+        "url": str(scan_data.get("url") or header_results.get("url", "")),
+        "header_score": _require_int(header_results.get("score", 0), "score"),
         "header_grade": str(header_results.get("grade", "F")),
-        "missing_headers": missing_headers,
-        "open_ports": open_ports,
+        "missing_headers": sorted(missing_headers_list),
+        "open_ports": sorted(parsed_ports),
         "ssl_status": str(
             ssl_results.get("status") or scan_data.get("ssl_status") or "unknown"
         ),
@@ -54,8 +108,14 @@ def build_baseline_snapshot(scan_data: dict[str, Any]) -> dict[str, Any]:
 
 def save_baseline(scan_data: dict[str, Any], filepath: str) -> None:
     """Persist the current scan snapshot as formatted JSON."""
-    snapshot = build_baseline_snapshot(scan_data)
+    if not isinstance(filepath, str) or not filepath.strip():
+        raise ValueError("Baseline file path cannot be empty.")
+
     target_path = Path(filepath)
+    if target_path.exists() and target_path.is_dir():
+        raise IsADirectoryError(f"Baseline path points to a directory: {filepath}")
+
+    snapshot = build_baseline_snapshot(scan_data)
     if target_path.parent:
         target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
@@ -91,7 +151,7 @@ def compare_baseline(current_scan: dict[str, Any], baseline_path: str) -> dict[s
         if not isinstance(baseline_data, dict):
             raise ValueError("Baseline JSON root must be an object.")
         baseline = build_baseline_snapshot(baseline_data)
-    except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         return {
             "status": "ERROR",
             "error": f"Failed to load baseline '{baseline_path}': {exc}",

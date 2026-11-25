@@ -14,23 +14,40 @@ def _sanitize_hostname(url: str) -> str:
     """Extract and sanitize hostname for safe report filenames."""
     parsed = urlparse(url)
     raw_host = parsed.hostname or "target"
+    if ":" in raw_host:
+        ipv6_clean = re.sub(r"[^A-Za-z0-9]+", "_", raw_host).strip("_")
+        return f"ipv6_{ipv6_clean}" if ipv6_clean else "ipv6_target"
     sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", raw_host).strip("._")
     return sanitized or "target"
 
 
 def _build_report_path(url: str, output_dir: str, extension: str) -> Path:
-    """Build a timestamped report path inside output_dir and ensure directory exists."""
+    """Build a unique timestamped report path inside output_dir."""
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     hostname = _sanitize_hostname(url)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return target_dir / f"{hostname}_{timestamp}.{extension}"
+    candidate = target_dir / f"{hostname}_{timestamp}.{extension}"
+    counter = 1
+    while candidate.exists():
+        candidate = target_dir / f"{hostname}_{timestamp}_{counter}.{extension}"
+        counter += 1
+    return candidate
 
 
 def _escape_md(value: Any) -> str:
-    """Escape pipe characters and newlines for Markdown table cells."""
+    """Escape Markdown table delimiters, backticks, newlines, and raw HTML tags."""
     text = str(value if value is not None else "")
-    return text.replace("|", "\\|").replace("\n", " ").strip()
+    text = text.replace("\r", "").replace("\n", " ")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("|", "\\|").replace("`", "\\`")
+    return text.strip()
+
+
+def _markdown_fence(content: str) -> str:
+    """Return a backtick fence longer than any backtick sequence in content."""
+    longest = max((len(match.group(0)) for match in re.finditer(r"`+", content)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 def _format_ssl_summary_line(ssl_results: dict[str, Any]) -> str:
@@ -51,10 +68,16 @@ def _collect_header_rows(header_results: dict[str, Any]) -> list[dict[str, str]]
     """Combine security header and disclosure findings into uniform table rows."""
     rows: list[dict[str, str]] = []
     for item in header_results.get("security_headers", []):
-        tip = (
-            f"Value: `{item.get('value')}`"
-            if item.get("status") == "Present"
+        is_present = item.get("status") == "Present"
+        raw_tip = (
+            str(item.get("value") or "")
+            if is_present
             else str(item.get("remediation") or "")
+        )
+        md_tip = (
+            f"Value: `{_escape_md(raw_tip)}`"
+            if is_present
+            else _escape_md(raw_tip)
         )
         rows.append(
             {
@@ -62,10 +85,8 @@ def _collect_header_rows(header_results: dict[str, Any]) -> list[dict[str, str]]
                 "status": str(item.get("status", "")),
                 "severity": str(item.get("severity", "")),
                 "cwe": str(item.get("cwe", "")),
-                "tip": tip,
-                "raw_tip": str(item.get("value") or "")
-                if item.get("status") == "Present"
-                else str(item.get("remediation") or ""),
+                "md_tip": md_tip,
+                "raw_tip": raw_tip,
             }
         )
     for item in header_results.get("info_disclosure", []):
@@ -77,7 +98,7 @@ def _collect_header_rows(header_results: dict[str, Any]) -> list[dict[str, str]]
                 "status": str(item.get("status", "Exposed")),
                 "severity": str(item.get("severity", "Info")),
                 "cwe": str(item.get("cwe", "CWE-200")),
-                "tip": f"Exposed `{exposed_val}` — {remediation}",
+                "md_tip": f"Exposed `{_escape_md(exposed_val)}` — {_escape_md(remediation)}",
                 "raw_tip": f"Exposed: {exposed_val} — {remediation}",
             }
         )
@@ -95,12 +116,12 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
     Returns:
         File path to the written Markdown report.
     """
-    url = str(scan_data.get("url") or scan_data.get("header_results", {}).get("url") or "")
+    header_results = scan_data.get("header_results") or {}
+    url = str(scan_data.get("url") or header_results.get("url") or "")
     timestamp = str(
         scan_data.get("timestamp")
         or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     )
-    header_results = scan_data.get("header_results") or {}
     ssl_results = scan_data.get("ssl_results") or {}
     port_results = scan_data.get("port_results")
     remediation = scan_data.get("remediation")
@@ -109,6 +130,8 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
 
     score = header_results.get("score", 0)
     grade = header_results.get("grade", "F")
+    status_code = header_results.get("status_code")
+    final_url = header_results.get("final_url")
     ssl_summary = _format_ssl_summary_line(ssl_results)
 
     lines: list[str] = [
@@ -116,16 +139,32 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
         "",
         "## Executive Summary",
         "",
-        f"- **Target URL:** {url}",
-        f"- **Scan Timestamp:** {timestamp}",
-        f"- **Security Header Score:** {score}/100 (Grade: {grade})",
-        f"- **SSL/TLS Status:** {ssl_summary}",
-        "",
-        "## HTTP Security Headers & CWE Findings",
-        "",
-        "| Header | Status | Severity | CWE ID | Value / Remediation Tip |",
-        "| --- | --- | --- | --- | --- |",
+        f"- **Target URL:** {_escape_md(url)}",
+        f"- **Scan Timestamp:** {_escape_md(timestamp)}",
+        f"- **Security Header Score:** {_escape_md(score)}/100 (Grade: {_escape_md(grade)})",
+        f"- **SSL/TLS Status:** {_escape_md(ssl_summary)}",
     ]
+
+    if status_code is not None:
+        status_note = (
+            f"{status_code} (Warning: HTTP error status)"
+            if isinstance(status_code, int) and status_code >= 400
+            else str(status_code)
+        )
+        lines.append(f"- **HTTP Status Code:** {_escape_md(status_note)}")
+
+    if final_url and final_url != url:
+        lines.append(f"- **Redirected Final URL:** {_escape_md(final_url)}")
+
+    lines.extend(
+        [
+            "",
+            "## HTTP Security Headers & CWE Findings",
+            "",
+            "| Header | Status | Severity | CWE ID | Value / Remediation Tip |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+    )
 
     for row in _collect_header_rows(header_results):
         lines.append(
@@ -133,7 +172,7 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
             f"| {_escape_md(row['status'])} "
             f"| {_escape_md(row['severity'])} "
             f"| {_escape_md(row['cwe'])} "
-            f"| {_escape_md(row['tip'])} |"
+            f"| {row['md_tip']} |"
         )
 
     lines.extend(["", "## SSL/TLS & Open Ports", ""])
@@ -141,21 +180,21 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
     if ssl_status == "ok":
         lines.extend(
             [
-                f"- **Target:** {ssl_results.get('hostname')}:{ssl_results.get('port')}",
-                f"- **TLS Version:** {ssl_results.get('tls_version')}",
-                f"- **Subject (CN):** {ssl_results.get('subject')}",
-                f"- **Issuer:** {ssl_results.get('issuer')}",
-                f"- **Valid From:** {ssl_results.get('not_before')}",
-                f"- **Valid Until:** {ssl_results.get('not_after')}",
-                f"- **Days Remaining:** {ssl_results.get('days_remaining')}",
+                f"- **Target:** {_escape_md(ssl_results.get('hostname'))}:{_escape_md(ssl_results.get('port'))}",
+                f"- **TLS Version:** {_escape_md(ssl_results.get('tls_version'))}",
+                f"- **Subject (CN):** {_escape_md(ssl_results.get('subject'))}",
+                f"- **Issuer:** {_escape_md(ssl_results.get('issuer'))}",
+                f"- **Valid From:** {_escape_md(ssl_results.get('not_before'))}",
+                f"- **Valid Until:** {_escape_md(ssl_results.get('not_after'))}",
+                f"- **Days Remaining:** {_escape_md(ssl_results.get('days_remaining'))}",
             ]
         )
         if ssl_results.get("warning"):
-            lines.append(f"- **Warning:** {ssl_results['warning']}")
+            lines.append(f"- **Warning:** {_escape_md(ssl_results['warning'])}")
     elif ssl_status == "not_https":
-        lines.append(f"- **Warning:** {ssl_results.get('note')}")
+        lines.append(f"- **Warning:** {_escape_md(ssl_results.get('note'))}")
     elif ssl_status == "error":
-        lines.append(f"- **SSL/TLS Error:** {ssl_results.get('error')}")
+        lines.append(f"- **SSL/TLS Error:** {_escape_md(ssl_results.get('error'))}")
     else:
         lines.append("- **SSL/TLS:** Not inspected.")
 
@@ -186,33 +225,35 @@ def export_markdown(scan_data: dict[str, Any], output_dir: str = "reports") -> s
         lines.append("Port scan not enabled for this run (pass `--ports` to include).")
 
     if remediation:
-        lang = "javascript" if remediation_stack == "express" else remediation_stack
-        title_suffix = f" ({remediation_stack})" if remediation_stack else ""
+        lang = "javascript" if remediation_stack == "express" else _escape_md(remediation_stack)
+        title_suffix = f" ({_escape_md(remediation_stack)})" if remediation_stack else ""
+        remediation_text = str(remediation)
+        fence = _markdown_fence(remediation_text)
         lines.extend(
             [
                 "",
                 f"## Auto-Remediation Patch{title_suffix}",
                 "",
-                f"```{lang}",
-                str(remediation),
-                "```",
+                f"{fence}{lang}",
+                remediation_text,
+                fence,
             ]
         )
 
     if drift_results:
         lines.extend(["", "## Security Drift Report", ""])
         if drift_results.get("status") == "ERROR":
-            lines.append(f"- **Error:** {drift_results.get('error')}")
+            lines.append(f"- **Error:** {_escape_md(drift_results.get('error'))}")
         else:
             lines.extend(
                 [
-                    f"- **Drift Status:** {drift_results.get('status')}",
-                    f"- **Score Change:** {drift_results.get('baseline_score')} -> "
-                    f"{drift_results.get('current_score')} ({drift_results.get('score_delta_str')})",
-                    f"- **New Missing Headers:** {', '.join(drift_results.get('new_missing_headers') or []) or 'None'}",
-                    f"- **Fixed Headers:** {', '.join(drift_results.get('fixed_headers') or []) or 'None'}",
-                    f"- **New Open Ports:** {', '.join(str(p) for p in (drift_results.get('new_open_ports') or [])) or 'None'}",
-                    f"- **Closed Ports:** {', '.join(str(p) for p in (drift_results.get('closed_ports') or [])) or 'None'}",
+                    f"- **Drift Status:** {_escape_md(drift_results.get('status'))}",
+                    f"- **Score Change:** {_escape_md(drift_results.get('baseline_score'))} -> "
+                    f"{_escape_md(drift_results.get('current_score'))} ({_escape_md(drift_results.get('score_delta_str'))})",
+                    f"- **New Missing Headers:** {_escape_md(', '.join(drift_results.get('new_missing_headers') or []) or 'None')}",
+                    f"- **Fixed Headers:** {_escape_md(', '.join(drift_results.get('fixed_headers') or []) or 'None')}",
+                    f"- **New Open Ports:** {_escape_md(', '.join(str(p) for p in (drift_results.get('new_open_ports') or [])) or 'None')}",
+                    f"- **Closed Ports:** {_escape_md(', '.join(str(p) for p in (drift_results.get('closed_ports') or [])) or 'None')}",
                 ]
             )
 
@@ -244,12 +285,12 @@ def export_html(scan_data: dict[str, Any], output_dir: str = "reports") -> str:
     Returns:
         File path to the written HTML report.
     """
-    url = str(scan_data.get("url") or scan_data.get("header_results", {}).get("url") or "")
+    header_results = scan_data.get("header_results") or {}
+    url = str(scan_data.get("url") or header_results.get("url") or "")
     timestamp = str(
         scan_data.get("timestamp")
         or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     )
-    header_results = scan_data.get("header_results") or {}
     ssl_results = scan_data.get("ssl_results") or {}
     port_results = scan_data.get("port_results")
     remediation = scan_data.get("remediation")
@@ -258,6 +299,8 @@ def export_html(scan_data: dict[str, Any], output_dir: str = "reports") -> str:
 
     score = header_results.get("score", 0)
     grade = str(header_results.get("grade", "F"))
+    status_code = header_results.get("status_code")
+    final_url = header_results.get("final_url")
     ssl_summary = _format_ssl_summary_line(ssl_results)
 
     header_rows_html = []
@@ -313,13 +356,13 @@ def export_html(scan_data: dict[str, Any], output_dir: str = "reports") -> str:
                 for entry in open_ports
             )
             ports_block_html = (
-                f"<h3>Open Common Ports ({len(open_ports)}/{scanned_count} Open)</h3>"
+                f"<h3>Open Common Ports ({html.escape(str(len(open_ports)))}/{html.escape(str(scanned_count))} Open)</h3>"
                 "<div class=\"table-wrap\"><table><thead><tr><th>Port</th><th>Service</th><th>Status</th></tr></thead>"
                 f"<tbody>{port_rows}</tbody></table></div>"
             )
         else:
             ports_block_html = (
-                f"<p class=\"alert-ok\">No open ports detected ({scanned_count} common ports scanned).</p>"
+                f"<p class=\"alert-ok\">No open ports detected ({html.escape(str(scanned_count))} common ports scanned).</p>"
             )
     else:
         ports_block_html = "<p class=\"muted\">Port scan not enabled for this run (pass <code>--ports</code> to include).</p>"
@@ -356,6 +399,17 @@ def export_html(scan_data: dict[str, Any], output_dir: str = "reports") -> str:
                 "</div>"
             )
         drift_section_html = f"<section class=\"card\"><h2>Security Drift Report</h2>{drift_inner}</section>"
+
+    extra_summary_items = []
+    if status_code is not None:
+        status_cls = "badge-yellow" if isinstance(status_code, int) and status_code >= 400 else "badge-green"
+        extra_summary_items.append(
+            f"<div><span>HTTP Status</span><span class=\"badge {status_cls}\">{html.escape(str(status_code))}</span></div>"
+        )
+    if final_url and final_url != url:
+        extra_summary_items.append(
+            f"<div><span>Redirected Final URL</span><strong>{html.escape(str(final_url))}</strong></div>"
+        )
 
     grade_cls = _badge_class(grade)
     html_doc = f"""<!DOCTYPE html>
@@ -448,6 +502,7 @@ def export_html(scan_data: dict[str, Any], output_dir: str = "reports") -> str:
         <div><span>Scan Timestamp</span><strong>{html.escape(timestamp)}</strong></div>
         <div><span>Security Header Score</span><strong>{html.escape(str(score))}/100</strong> <span class="badge {grade_cls}">Grade {html.escape(grade)}</span></div>
         <div><span>SSL/TLS Status</span><strong>{html.escape(ssl_summary)}</strong></div>
+        {''.join(extra_summary_items)}
       </div>
     </section>
 

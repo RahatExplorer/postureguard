@@ -85,13 +85,18 @@ def validate_url(url: str) -> str:
         )
 
     try:
-        _ = parsed.port
+        port = parsed.port
     except ValueError:
         _exit_with_url_error(
             f"Target URL '{cleaned}' contains an invalid port number."
         )
 
-    return cleaned
+    if port is not None and port < 1:
+        _exit_with_url_error(
+            f"Target URL '{cleaned}' contains an invalid port number ({port})."
+        )
+
+    return parsed._replace(scheme=scheme).geturl()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -309,7 +314,7 @@ _STACK_LEXERS = {
 }
 
 
-def display_remediation_panel(header_results: dict[str, Any], stack: str) -> None:
+def display_remediation_panel(header_results: dict[str, Any], stack: str) -> str:
     """Render auto-generated remediation config in a syntax-highlighted panel."""
     snippet = generate_remediation(header_results, stack)
     if snippet.startswith("No header patches required"):
@@ -320,7 +325,7 @@ def display_remediation_panel(header_results: dict[str, Any], stack: str) -> Non
                 border_style="green",
             )
         )
-        return
+        return snippet
 
     lexer = _STACK_LEXERS.get(stack, "text")
     syntax = Syntax(snippet, lexer, theme="monokai", line_numbers=True)
@@ -331,6 +336,7 @@ def display_remediation_panel(header_results: dict[str, Any], stack: str) -> Non
             border_style="cyan",
         )
     )
+    return snippet
 
 
 def display_drift_report(drift: dict[str, Any]) -> None:
@@ -395,22 +401,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
+    final_url = scan_result.get("final_url")
+    if isinstance(final_url, str) and final_url and final_url != validated_url:
+        console.print(Text(f"Redirected to: {final_url}", style="cyan"))
+
+    status_code = scan_result.get("status_code")
+    if isinstance(status_code, int) and status_code >= 400:
+        console.print(
+            Panel.fit(
+                Text(
+                    f"Target returned HTTP {status_code}; header findings reflect this error response.",
+                    style="bold yellow",
+                ),
+                title="HTTP Status Warning",
+                border_style="yellow",
+            )
+        )
+
     display_header_results(scan_result)
 
-    ssl_result = inspect_ssl(validated_url)
+    effective_url = final_url if isinstance(final_url, str) and final_url else validated_url
+    initial_scheme = urlparse(validated_url).scheme.lower()
+    final_scheme = urlparse(effective_url).scheme.lower()
+
+    if initial_scheme == "http" and final_scheme == "https":
+        console.print(
+            Panel.fit(
+                Text(
+                    "Initial URL used unencrypted HTTP (CWE-319) before redirecting to HTTPS; inspecting final HTTPS endpoint.",
+                    style="bold yellow",
+                ),
+                title="HTTP-to-HTTPS Redirect Note",
+                border_style="yellow",
+            )
+        )
+        ssl_result = inspect_ssl(effective_url)
+    else:
+        ssl_result = inspect_ssl(effective_url if final_scheme == "https" else validated_url)
+
     display_ssl_results(ssl_result)
 
     port_result: dict[str, Any] | None = None
     if args.ports:
-        hostname = urlparse(validated_url).hostname
+        hostname = urlparse(effective_url).hostname or urlparse(validated_url).hostname
         if hostname:
             port_result = scan_ports(hostname)
             display_port_results(port_result)
 
     remediation_snippet: str | None = None
     if args.remediate:
-        remediation_snippet = generate_remediation(scan_result, args.remediate)
-        display_remediation_panel(scan_result, args.remediate)
+        remediation_snippet = display_remediation_panel(scan_result, args.remediate)
 
     current_snapshot_input = {
         "url": validated_url,
@@ -419,19 +459,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         "port_results": port_result or {"open_ports": []},
     }
 
+    exit_code = 0
     drift_result: dict[str, Any] | None = None
     if args.diff:
         drift_result = compare_baseline(current_snapshot_input, args.diff)
         display_drift_report(drift_result)
+        if drift_result.get("status") == "ERROR":
+            exit_code = 1
 
     if args.save_baseline:
-        save_baseline(current_snapshot_input, args.save_baseline)
-        console.print(
-            Text(
-                f"Baseline snapshot saved to: {args.save_baseline}",
-                style="bold green",
+        try:
+            save_baseline(current_snapshot_input, args.save_baseline)
+            console.print(
+                Text(
+                    f"Baseline snapshot saved to: {args.save_baseline}",
+                    style="bold green",
+                )
             )
-        )
+        except (OSError, ValueError) as exc:
+            console.print(
+                Panel(
+                    Text(f"Failed to save baseline '{args.save_baseline}': {exc}", style="bold red"),
+                    title="Baseline Save Error",
+                    border_style="red",
+                )
+            )
+            exit_code = 1
 
     if args.output:
         report_payload = {
@@ -444,14 +497,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             "remediation_stack": args.remediate,
             "drift_results": drift_result,
         }
-        if args.output in {"md", "both"}:
-            md_path = export_markdown(report_payload)
-            console.print(Text(f"Markdown report saved: {md_path}", style="bold green"))
-        if args.output in {"html", "both"}:
-            html_path = export_html(report_payload)
-            console.print(Text(f"HTML report saved: {html_path}", style="bold green"))
+        try:
+            if args.output in {"md", "both"}:
+                md_path = export_markdown(report_payload)
+                console.print(Text(f"Markdown report saved: {md_path}", style="bold green"))
+            if args.output in {"html", "both"}:
+                html_path = export_html(report_payload)
+                console.print(Text(f"HTML report saved: {html_path}", style="bold green"))
+        except OSError as exc:
+            console.print(
+                Panel(
+                    Text(f"Failed to export report: {exc}", style="bold red"),
+                    title="Report Export Error",
+                    border_style="red",
+                )
+            )
+            exit_code = 1
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
