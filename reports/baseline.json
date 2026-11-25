@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-11-25T14:15:25.740606+00:00",
+  "url": "http://localhost:8000",
+  "header_score": 0,
+  "header_grade": "F",
+  "missing_headers": [
+    "Content-Security-Policy",
+    "Permissions-Policy",
+    "Referrer-Policy",
+    "Strict-Transport-Security",
+    "X-Content-Type-Options",
+    "X-Frame-Options"
+  ],
+  "open_ports": [
+    8000
+  ],
+  "ssl_status": "not_https"
+}

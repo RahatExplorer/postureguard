@@ -9,14 +9,17 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from modules.drift_detector import compare_baseline, save_baseline
 from modules.header_scanner import scan_headers
 from modules.port_scanner import scan_ports
+from modules.remediator import generate_remediation
 from modules.ssl_inspector import inspect_ssl
 
-VERSION = "0.3"
+VERSION = "0.4"
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 console = Console()
@@ -105,6 +108,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Run a safe common-port TCP scan against the target hostname.",
+    )
+    parser.add_argument(
+        "--remediate",
+        choices=["nginx", "apache", "express"],
+        default=None,
+        help="Generate copy-pasteable remediation config for the specified stack.",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        default=None,
+        metavar="PATH",
+        help="Save current scan results as a JSON baseline snapshot.",
+    )
+    parser.add_argument(
+        "--diff",
+        default=None,
+        metavar="PATH",
+        help="Compare current scan results against a previously saved JSON baseline.",
     )
     return parser
 
@@ -273,6 +294,74 @@ def display_port_results(port_result: dict[str, Any]) -> None:
     console.print(table)
 
 
+_STACK_LEXERS = {
+    "nginx": "nginx",
+    "apache": "apache",
+    "express": "javascript",
+}
+
+
+def display_remediation_panel(header_results: dict[str, Any], stack: str) -> None:
+    """Render auto-generated remediation config in a syntax-highlighted panel."""
+    snippet = generate_remediation(header_results, stack)
+    if snippet.startswith("No header patches required"):
+        console.print(
+            Panel.fit(
+                Text(snippet, style="bold green"),
+                title=f"Auto-Remediation ({stack})",
+                border_style="green",
+            )
+        )
+        return
+
+    lexer = _STACK_LEXERS.get(stack, "text")
+    syntax = Syntax(snippet, lexer, theme="monokai", line_numbers=True)
+    console.print(
+        Panel(
+            syntax,
+            title=f"Auto-Remediation Patch ({stack})",
+            border_style="cyan",
+        )
+    )
+
+
+def display_drift_report(drift: dict[str, Any]) -> None:
+    """Render a color-coded security drift comparison panel."""
+    status = drift.get("status", "ERROR")
+    if status == "ERROR":
+        console.print(
+            Panel(
+                Text(str(drift.get("error", "Unknown baseline error.")), style="bold red"),
+                title="Drift Detection Error",
+                border_style="red",
+            )
+        )
+        return
+
+    border_colors = {
+        "REGRESSED": "red",
+        "IMPROVED": "green",
+        "UNCHANGED": "cyan",
+    }
+    color = border_colors.get(status, "cyan")
+
+    lines = [
+        f"Drift Status: {status}",
+        f"Score Change: {drift['baseline_score']} -> {drift['current_score']} ({drift['score_delta_str']})",
+        f"New Missing Headers: {', '.join(drift['new_missing_headers']) or 'None'}",
+        f"Fixed Headers: {', '.join(drift['fixed_headers']) or 'None'}",
+        f"New Open Ports: {', '.join(str(p) for p in drift['new_open_ports']) or 'None'}",
+        f"Closed Ports: {', '.join(str(p) for p in drift['closed_ports']) or 'None'}",
+    ]
+    console.print(
+        Panel.fit(
+            Text("\n".join(lines), style=f"bold {color}" if status != "UNCHANGED" else "cyan"),
+            title="Security Drift Report",
+            border_style=color,
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint for PostureGuard."""
     parser = build_parser()
@@ -303,11 +392,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     ssl_result = inspect_ssl(validated_url)
     display_ssl_results(ssl_result)
 
+    port_result: dict[str, Any] | None = None
     if args.ports:
         hostname = urlparse(validated_url).hostname
         if hostname:
             port_result = scan_ports(hostname)
             display_port_results(port_result)
+
+    if args.remediate:
+        display_remediation_panel(scan_result, args.remediate)
+
+    current_snapshot_input = {
+        "url": validated_url,
+        "header_results": scan_result,
+        "ssl_results": ssl_result,
+        "port_results": port_result or {"open_ports": []},
+    }
+
+    if args.diff:
+        drift_result = compare_baseline(current_snapshot_input, args.diff)
+        display_drift_report(drift_result)
+
+    if args.save_baseline:
+        save_baseline(current_snapshot_input, args.save_baseline)
+        console.print(
+            Text(
+                f"Baseline snapshot saved to: {args.save_baseline}",
+                style="bold green",
+            )
+        )
 
     return 0
 
