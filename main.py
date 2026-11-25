@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Sequence
+from typing import Any, Sequence
 from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
-VERSION = "0.1"
+from modules.header_scanner import scan_headers
+
+VERSION = "0.2"
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 console = Console()
@@ -98,6 +101,81 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SEVERITY_STYLES = {
+    "High": "bold red",
+    "Medium": "yellow",
+    "Low": "cyan",
+    "Info": "blue",
+}
+
+
+def _status_text(status: str) -> Text:
+    """Format finding status with color coding."""
+    if status == "Present":
+        return Text(status, style="bold green")
+    if status == "Missing":
+        return Text(status, style="bold red")
+    return Text(status, style="bold yellow")
+
+
+def _grade_style(grade: str) -> str:
+    """Return Rich border/text color for a security letter grade."""
+    if grade in {"A", "B"}:
+        return "green"
+    if grade in {"C", "D"}:
+        return "yellow"
+    return "red"
+
+
+def display_header_results(result: dict[str, Any]) -> None:
+    """Render HTTP security header scan results and summary score panel."""
+    table = Table(
+        title="HTTP Security Header Analysis",
+        show_header=True,
+        header_style="bold magenta",
+        show_lines=True,
+    )
+    table.add_column("Header Name", style="bold white", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Severity", justify="center", no_wrap=True)
+    table.add_column("CWE ID", justify="center", no_wrap=True)
+    table.add_column("Value/Note", overflow="fold")
+
+    for item in result["security_headers"]:
+        note = (
+            item["value"]
+            if item["status"] == "Present"
+            else item["remediation"]
+        )
+        severity = item["severity"]
+        table.add_row(
+            Text(item["header"], style="bold white"),
+            _status_text(item["status"]),
+            Text(severity, style=_SEVERITY_STYLES.get(severity, "white")),
+            Text(item["cwe"], style="dim"),
+            Text(note or ""),
+        )
+
+    for item in result["info_disclosure"]:
+        note = f"Exposed: {item['value']} | Tip: {item['remediation']}"
+        severity = item["severity"]
+        table.add_row(
+            Text(item["header"], style="bold white"),
+            _status_text(item["status"]),
+            Text(severity, style=_SEVERITY_STYLES.get(severity, "blue")),
+            Text(item["cwe"], style="dim"),
+            Text(note),
+        )
+
+    console.print(table)
+
+    score = result["score"]
+    grade = result["grade"]
+    grade_color = _grade_style(grade)
+    summary = Text(f"Score: {score}/100 (Grade: {grade})", style=f"bold {grade_color}")
+    console.print(Panel.fit(summary, title="Security Posture Summary", border_style=grade_color))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint for PostureGuard."""
     parser = build_parser()
@@ -107,10 +185,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     validated_url = validate_url(args.url)
     console.print(
         Text(
-            f"Target validated: {validated_url}. Ready for scanning modules.",
+            f"Target validated: {validated_url}. Running HTTP header scan...",
             style="bold green",
         )
     )
+
+    scan_result = scan_headers(validated_url)
+    if scan_result.get("error"):
+        console.print(
+            Panel(
+                Text(str(scan_result["error"]), style="bold red"),
+                title="Scan Error",
+                border_style="red",
+            )
+        )
+        return 1
+
+    display_header_results(scan_result)
     return 0
 
 
