@@ -13,8 +13,10 @@ from rich.table import Table
 from rich.text import Text
 
 from modules.header_scanner import scan_headers
+from modules.port_scanner import scan_ports
+from modules.ssl_inspector import inspect_ssl
 
-VERSION = "0.2"
+VERSION = "0.3"
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 
 console = Console()
@@ -98,6 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Target URL to validate (must include http:// or https://).",
     )
+    parser.add_argument(
+        "--ports",
+        action="store_true",
+        default=False,
+        help="Run a safe common-port TCP scan against the target hostname.",
+    )
     return parser
 
 
@@ -176,6 +184,95 @@ def display_header_results(result: dict[str, Any]) -> None:
     console.print(Panel.fit(summary, title="Security Posture Summary", border_style=grade_color))
 
 
+def display_ssl_results(ssl_result: dict[str, Any]) -> None:
+    """Render SSL/TLS certificate inspection results in a panel or table."""
+    status = ssl_result.get("status")
+    if status == "not_https":
+        console.print(
+            Panel.fit(
+                Text(str(ssl_result["note"]), style="bold yellow"),
+                title="SSL/TLS Inspection",
+                border_style="yellow",
+            )
+        )
+        return
+
+    if status == "error":
+        console.print(
+            Panel(
+                Text(str(ssl_result["error"]), style="bold red"),
+                title="SSL/TLS Inspection Error",
+                border_style="red",
+            )
+        )
+        return
+
+    table = Table(
+        title="SSL/TLS Inspection",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("Property", style="bold white", no_wrap=True)
+    table.add_column("Value", overflow="fold")
+
+    days = ssl_result.get("days_remaining")
+    days_display = f"{days} days" if days is not None else "Unknown"
+    days_style = "bold red" if (days is not None and days < 30) else "green"
+
+    table.add_row("Target", Text(f"{ssl_result['hostname']}:{ssl_result['port']}"))
+    table.add_row("TLS Version", Text(str(ssl_result.get("tls_version") or "Unknown")))
+    table.add_row("Subject (CN)", Text(str(ssl_result.get("subject") or "Unknown")))
+    table.add_row("Issuer", Text(str(ssl_result.get("issuer") or "Unknown")))
+    table.add_row("Valid From", Text(str(ssl_result.get("not_before") or "Unknown")))
+    table.add_row("Valid Until", Text(str(ssl_result.get("not_after") or "Unknown")))
+    table.add_row("Days Remaining", Text(days_display, style=days_style))
+
+    if ssl_result.get("warning"):
+        table.add_row("Warning", Text(str(ssl_result["warning"]), style="bold yellow"))
+
+    console.print(table)
+
+
+def display_port_results(port_result: dict[str, Any]) -> None:
+    """Render common TCP port scan results."""
+    open_ports = port_result.get("open_ports", [])
+    scanned_count = port_result.get("scanned_count", 0)
+    hostname = port_result.get("hostname", "")
+
+    if not open_ports:
+        console.print(
+            Panel.fit(
+                Text(
+                    f"No open ports detected on {hostname} ({scanned_count} common ports scanned).",
+                    style="bold green",
+                ),
+                title="Common Port Scan",
+                border_style="green",
+            )
+        )
+        return
+
+    table = Table(
+        title=f"Common Port Scan ({hostname} - {len(open_ports)}/{scanned_count} Open)",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("Port", justify="right", style="bold white", no_wrap=True)
+    table.add_column("Service", style="cyan", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+
+    for entry in open_ports:
+        table.add_row(
+            Text(str(entry["port"])),
+            Text(str(entry["service"])),
+            Text(str(entry["status"]).upper(), style="bold yellow"),
+        )
+
+    console.print(table)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint for PostureGuard."""
     parser = build_parser()
@@ -185,7 +282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     validated_url = validate_url(args.url)
     console.print(
         Text(
-            f"Target validated: {validated_url}. Running HTTP header scan...",
+            f"Target validated: {validated_url}. Running security checks...",
             style="bold green",
         )
     )
@@ -202,6 +299,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     display_header_results(scan_result)
+
+    ssl_result = inspect_ssl(validated_url)
+    display_ssl_results(ssl_result)
+
+    if args.ports:
+        hostname = urlparse(validated_url).hostname
+        if hostname:
+            port_result = scan_ports(hostname)
+            display_port_results(port_result)
+
     return 0
 
 
