@@ -49,7 +49,7 @@ postureguard/
 ## Installation
 
 ```bash
-git clone <your-repo-url> postureguard
+git clone <https://github.com/RahatExplorer/postureguard> postureguard
 cd postureguard
 
 python -m venv venv
